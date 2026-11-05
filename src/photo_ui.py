@@ -69,7 +69,8 @@ def empty_state() -> None:
 
 
 @st.dialog('Image details', width='large')
-def image_details(directory: str, record: dict, rank: int, score: float) -> None:
+def image_details(directory: str, record: dict, rank: int, score: float,
+                  cosine: float | None = None, blip_logit: float | None = None) -> None:
     path = image_file(directory, record)
     try:
         original = path.read_bytes()
@@ -79,8 +80,11 @@ def image_details(directory: str, record: dict, rank: int, score: float) -> None
     except (OSError, UnidentifiedImageError, ValueError):
         st.warning('This image is currently unavailable. Please try another result.')
         return
-    st.markdown(f'**Result #{rank:02d}** · **{score:.4f}** cosine similarity')
-    st.caption('Similarity describes how closely the image matches your words. It is not a probability.')
+    score_label = 'match score' if cosine is not None else 'cosine similarity'
+    st.markdown(f'**Result #{rank:02d}** · **{score:.4f}** {score_label}')
+    st.caption('The score describes how closely the image matches your words. It is not a probability.')
+    if cosine is not None:
+        st.caption(f'Visual-text cosine: {cosine:.4f} · Image-text matching logit: {blip_logit:.4f}')
     first, second, third = st.columns(3)
     first.markdown(f'**Image ID**\n\n`{record["image_id"]}`')
     second.markdown(f'**Collection**\n\nFlickr8k · {escape(record["split"].title())}')
@@ -97,6 +101,9 @@ def result_gallery(hits, rows: list[dict], directory: str) -> None:
     with st.container(key='results_grid'):
         for rank, hit in enumerate(hits, 1):
             record = rows[hit.image_index]
+            fused = getattr(hit, 'fused_score', None)
+            score = fused if fused is not None else hit.cosine_similarity
+            label = 'match score' if fused is not None else 'similarity'
             with st.container(border=True, key=f'photo_{rank}'):
                 try:
                     st.image(thumbnail(directory, record['path']), width='stretch')
@@ -104,7 +111,9 @@ def result_gallery(hits, rows: list[dict], directory: str) -> None:
                     st.warning('Image unavailable')
                 st.markdown(f'''<div class="photo-meta">
                     <span class="rank">#{rank:02d}</span>
-                    <span class="score">{hit.cosine_similarity:.4f}<span> similarity</span></span>
+                    <span class="score">{score:.4f}<span> {label}</span></span>
                     </div>''', unsafe_allow_html=True)
                 if st.button('View image', key=f'view_{rank}', width='stretch'):
-                    image_details(directory, record, rank, hit.cosine_similarity)
+                    image_details(directory, record, rank, score,
+                                  cosine=hit.cosine_similarity if fused is not None else None,
+                                  blip_logit=getattr(hit, 'blip_logit', None))

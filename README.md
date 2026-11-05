@@ -1,11 +1,12 @@
 # VisioSearch — Natural-Language Photo Search
 
-**Computer Vision Final Project · Topic 11 · CLIP vs SigLIP · Flickr8k (8,000 images)**
+**Computer Vision Final Project · Topic 11 · SigLIP LoRA + BLIP ITM · Flickr8k (8,000 images)**
 
 VisioSearch is a focused photo-search application built with Streamlit. Describe an
 image in English, press **Enter** or **Search**, and explore real Flickr8k matches.
-The homepage uses SigLIP to rank **precomputed image embeddings** across the complete
-8,000-image gallery. It includes clickable examples, 5/10/20 results, a responsive
+The homepage uses the selected SigLIP LoRA checkpoint to retrieve 20 candidates
+from **precomputed fine-tuned image embeddings**, then BLIP ITM reranks them.
+It includes clickable examples, 5/10/20 results, a responsive
 grid, original-image dialogs with captions and metadata, and CSV export.
 
 The academic interface is preserved separately in `research_app.py`, including
@@ -15,7 +16,180 @@ not included in the main search navigation.
 **What it is:** A working project implementation (source code and experiment scripts).
 **What it is not yet:** A prebuilt 8,000-image index or a completed scientific experiment. Dataset and model weights are downloaded and embeddings are computed when you run the commands below. No unmeasured results are presented as real.
 
-## 1. Scientific protocol
+## Current branch: the frozen two-stage pipeline
+
+The development branch `feature/two-stage-retrieval` now uses:
+
+1. `google/siglip-base-patch16-224` with LoRA **batch16_r8_e5**, rank **8**, alpha **16**.
+2. The matching `embeddings_siglip_ablation_best.npy` from the supplied ablation ZIP.
+3. Exact cosine ranking against all **8,000** image vectors; stable Top-**20** selection.
+4. Frozen `Salesforce/blip-itm-base-coco` image-text matching for those 20 actual images.
+5. The notebook's **raw positive-class logit**, without sigmoid or softmax, followed by:
+
+```python
+def zscore(x):
+    x = np.asarray(x, dtype=np.float64)
+    return (x - x.mean()) / (x.std() + 1e-8)
+
+fusion = 0.25 * zscore(candidate_cosine) + 0.75 * zscore(blip_positive_logits)
+order = np.argsort(-fusion, kind="stable")
+```
+
+Both arrays are normalized over the **same 20 candidates**, independent of whether
+the user requests 5, 10 or 20 results. Candidate positions are mapped back to the
+original global image indices. No captions, ground-truth IDs or split labels enter
+the live ranking calculation. Captions are read only for the image-details view.
+
+The existing design and light/dark controls are retained. Cards now show the fused
+**match score**; the dialog and CSV retain the separate cosine and BLIP logit. Fused
+scores can be negative and are not probabilities. No research tabs or model controls
+were added to the homepage.
+
+### Windows / VS Code: prepare and launch this version
+
+Use the existing `.venv`, or install Python 3.11/3.12 and create one with
+`py -3.11 -m venv .venv`. Select `.venv\Scripts\python.exe` in VS Code.
+Keep the original 8,000 JPEGs and `metadata.jsonl` in `data/flickr8k`, and place the
+following **unmodified** files in `research_artifacts/`:
+
+- `Topic11_Ablation_Final_Outputs.zip`
+- `Topic11_BLIP_Final_8K_Evaluation.ipynb`
+- `Topic11_BLIP_Final_8K_Results.zip`
+
+From a PowerShell terminal in this project:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe scripts/prepare_two_stage.py --download-models
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+With the virtual environment activated, the launch command is still:
+
+```powershell
+python -m streamlit run app.py
+```
+
+The preparation step runs once, checks the selected checkpoint and the final audit's
+SHA-256 fingerprints, and writes these new runtime files:
+
+```text
+models/siglip_lora_batch16_r8_e5/
+    adapter_config.json, adapter_model.safetensors
+    preprocessor_config.json, tokenizer_config.json
+    special_tokens_map.json, spiece.model
+models/two_stage/runtime_manifest.json
+data/flickr8k/embeddings_siglip_lora_batch16_r8_e5.npy
+```
+
+The base SigLIP and BLIP checkpoints use `.cache/huggingface` (or an existing
+`HF_HOME`). Preparation is idempotent and refuses to replace different existing
+artifacts. ZIPs are never extracted when the web app starts. Original data,
+pretrained embeddings, LoRA exports, notebooks and result files remain unchanged.
+`models/`, `research_artifacts/`, data, arrays and weights are ignored by Git.
+
+Models load lazily on the first search. Models/indexes are Streamlit resources;
+metadata, query results and BLIP vision tokens are cached. The vision cache holds
+at most 64 images in FP16 on CPU, reproducing the notebook's saved-token round trip.
+On CUDA, inference uses the notebook's FP16 autocast; CPU uses FP32 computation with
+the same FP16 vision-cache round trip. Near-tie scores can differ across hardware.
+Artifact changes invalidate the resource cache and trigger hash checks again.
+
+### Checks, measurements and regression limits
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install pytest
+.\.venv\Scripts\python.exe -m compileall -q app.py src scripts
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe scripts/check_two_stage.py --reference-queries 3 --output .local/check-new.json
+```
+
+The original audit and result CSV report **63.14 / 83.08 / 88.06%** Recall@1/5/10.
+These are supplied research results, **not a newly reproduced web-app benchmark**.
+The results ZIP contains the per-query ranks but omits the original candidate
+arrays and BLIP logits, so a complete score-by-score replay is unavailable.
+Tests validate saved CSV consistency and compare fusion with the notebook functions.
+The diagnostic additionally compares real predicted IDs with saved references.
+
+Verification executed during this integration: **39 tests passed**, including
+real adapter-weight equality and activation, frozen model parameters, BLIP's cached
+ITM path against standard forward, Top-5/10/20 UI results, metadata/index alignment,
+cache invalidation, missing-input errors and explicit fallback. Syntax compilation
+and dependency checks passed. A temporary Streamlit server returned HTTP 200 / `ok`
+and was then stopped. All 20 protected original-file fingerprints were unchanged;
+the gallery still contains 8,000 JPEGs. Fresh-browser visual QA and CUDA inference
+were not rerun; the established CSS/layout files were not changed.
+
+Actual local CPU measurements (PyTorch `2.15.0+cpu`, Transformers `4.57.6`, PEFT
+`0.18.1`):
+
+| Search | SigLIP | BLIP + fusion | Pipeline total |
+|---|---:|---:|---:|
+| First query, including model loading | 5.38 s | 9.44 s | 14.83 s |
+| New query, loaded models | 0.05 s | 9.28 s | 9.33 s |
+| Repeated identical query | cached | cached | <0.001 s |
+
+These measure pipeline time, excluding browser rendering. Three first test-caption
+queries matched both saved SigLIP and final Top-1 IDs; this small sample does not
+establish full-test Recall. A complete fresh evaluation is opt-in and may take hours
+on CPU:
+
+```powershell
+.\.venv\Scripts\python.exe scripts/check_two_stage.py --reference-queries 5000 --output .local/full-test-new.json
+```
+
+Only a completed 5,000-query run prints fresh integrated Recall@K; that full run was
+**not executed** during this integration. Do not replace the reference claims with
+integrated-model claims until it is completed. The project had inspected earlier
+test results; the full gallery also contains LoRA training images. BLIP's upstream
+pretraining overlap is unknown. Exact-image Recall does not credit acceptable
+alternative photos.
+
+### Missing artifacts, CPU/GPU and explicit fallback
+
+- **Missing LoRA files/BLIP cache:** install requirements, then run
+  `scripts/prepare_two_stage.py --download-models`. The app fails with an actionable
+  message; it never switches models automatically after an error.
+- **Metadata/hash mismatch:** restore the exact original metadata and matching
+  exports. Do not reorder rows, rename IDs or substitute the pretrained embeddings.
+- **CPU latency:** BLIP is the main cost. CUDA is chosen automatically when
+  `torch.cuda.is_available()` is true. Installing a GPU driver alone does not make
+  a CPU-only PyTorch build CUDA-enabled; use the official
+  [PyTorch installation selector](https://pytorch.org/get-started/locally/) for a
+  suitable Windows CUDA build. CUDA inference was not exercised on this CPU build.
+- **GPU memory pressure:** reduce only compute batch sizes, then restart:
+
+  ```powershell
+  $env:TOPIC11_BLIP_VISION_BATCH = "4"
+  $env:TOPIC11_BLIP_PAIR_BATCH = "4"
+  ```
+
+  This keeps Top-20, raw-logit scoring and alpha=0.75 unchanged. Increase the bounded
+  vision cache only with appropriate RAM; do not change fusion to hide slow inference.
+- **Device selection:** `TOPIC11_DEVICE` accepts `auto`, `cpu` or `cuda`; an explicit
+  unavailable CUDA request fails with a clear message.
+- **Deliberate v1 fallback**, for troubleshooting only:
+
+  ```powershell
+  $env:TOPIC11_PIPELINE = "pretrained_siglip"
+  .\.venv\Scripts\python.exe -m streamlit run app.py
+  ```
+
+  A visible homepage warning and CSV model label identify this mode. Remove that
+  environment variable to return to the default two-stage pipeline. The unchanged
+  `research_app.py` and `scripts/evaluate.py` still run the original pretrained
+  CLIP/SigLIP experiments, not this final two-stage evaluation.
+
+New code is in `src/pipeline_artifacts.py`, `src/models/`, `src/two_stage_retriever.py`,
+`scripts/prepare_two_stage.py`, `scripts/check_two_stage.py` and `tests/test_two_stage*.py`.
+The integration adapts `src/search_service.py`, `app.py`, `src/photo_ui.py`, requirements,
+Git ignores and UI integration tests. No commit or push is performed automatically.
+
+## 1. Original v1 scientific protocol (retained baseline)
+
+The sections below describe the original pretrained-only baseline and its data
+preparation. The current two-stage model, fine-tuned index and final 8K evaluation
+protocol are specified above; do not confuse the two experimental settings.
 
 Dataset: [`intro/flickr8k`](https://huggingface.co/datasets/intro/flickr8k), with 8,000 images, each with 5 captions.
 

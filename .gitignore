@@ -25,3 +25,6 @@ htmlcov/
 *.pt
 *.pth
 *.safetensors
+/models/
+/research_artifacts/
+*.npz

@@ -1,11 +1,12 @@
 streamlit>=1.49,<2
-transformers>=4.48,<5
+transformers>=4.57.1,<4.58
+peft>=0.18.1,<0.19
 sentencepiece>=0.2,<0.3
 datasets>=3,<5
-torch>=2.2
-numpy>=1.26
+torch>=2.6
+numpy>=1.26,<3
 pandas>=2.0
 Pillow>=10.0
 matplotlib>=3.7
 tqdm>=4.66
-accelerate>=1.0
+accelerate>=1.4,<2

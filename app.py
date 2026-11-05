@@ -11,7 +11,6 @@ from io import StringIO
 import logging
 import os
 from pathlib import Path
-from time import perf_counter
 
 import streamlit as st
 
@@ -19,7 +18,8 @@ ROOT = Path(__file__).resolve().parent
 os.environ.setdefault('HF_HOME', str(ROOT / '.cache' / 'huggingface'))
 
 from src import photo_ui
-from src.search_service import DEFAULT_MODEL, embedding_matrix, find_matches, metadata_rows
+from src.search_service import DEFAULT_MODEL, active_pipeline, metadata_rows, prepare_search_index, retrieve
+from src.pipeline_artifacts import ArtifactError
 
 INDEX_DIR = Path(os.getenv('TOPIC11_INDEX_DIR', str(ROOT / 'data' / 'flickr8k')))
 LOGGER = logging.getLogger(__name__)
@@ -52,11 +52,7 @@ def search_controls() -> tuple[str, int, bool]:
                     top_k = st.selectbox('Number of results', [5, 10, 20], index=1,
                                          format_func=lambda value: f'{value} results',
                                          key='result_count', label_visibility='collapsed')
-                with hint:
-                    st.markdown('<p class="search-hint">Describe it in English · Press <kbd>Enter</kbd> to search</p>',
-                                unsafe_allow_html=True)
         with st.container(key='examples'):
-            st.markdown('<p class="examples-label">A little inspiration</p>', unsafe_allow_html=True)
             with st.container(key='example_buttons'):
                 for column, (label, example) in zip(st.columns(4, gap='small'), EXAMPLES):
                     column.button(label, key=f'example_{label}', on_click=choose_example,
@@ -71,11 +67,14 @@ def run_search(query: str, top_k: int, image_count: int) -> None:
         return
     try:
         with st.spinner('Finding your images…'):
-            started = perf_counter()
-            hits = find_matches(query, str(INDEX_DIR), image_count, top_k)
-            response = dict(query=query, hits=hits, elapsed=perf_counter() - started)
+            result = retrieve(query, str(INDEX_DIR), image_count, top_k)
+            response = dict(query=query, hits=list(result.hits), elapsed=result.timings.total_seconds,
+                            pipeline=result.pipeline, timings=vars(result.timings), cache_hit=result.cache_hit)
         # Keep the last successful response, so image dialogs never re-run retrieval.
         st.session_state['search_response'] = response
+    except ArtifactError as exc:
+        LOGGER.exception('Two-stage pipeline artifacts or model cache are unavailable')
+        st.error(str(exc))
     except (FileNotFoundError, OSError):
         LOGGER.exception('Photo search could not load local model or index files')
         st.error('The search model could not be loaded. Check your connection for the first download, '
@@ -88,13 +87,16 @@ def run_search(query: str, top_k: int, image_count: int) -> None:
 
 def export_results(response: dict, rows: list[dict]) -> bytes:
     buffer = StringIO()
-    writer = csv.DictWriter(buffer, fieldnames=['query', 'model', 'rank', 'image_id', 'split', 'cosine_similarity'])
+    writer = csv.DictWriter(buffer, fieldnames=['query', 'model', 'rank', 'image_id', 'split',
+                                               'cosine_similarity', 'blip_itm_logit', 'fused_score'])
     writer.writeheader()
     for rank, hit in enumerate(response['hits'], 1):
         row = rows[hit.image_index]
-        writer.writerow(dict(query=response['query'], model=DEFAULT_MODEL, rank=rank,
+        writer.writerow(dict(query=response['query'], model=response.get('pipeline', 'Unspecified legacy pipeline'), rank=rank,
                              image_id=row['image_id'], split=row['split'],
-                             cosine_similarity=hit.cosine_similarity))
+                             cosine_similarity=hit.cosine_similarity,
+                             blip_itm_logit=getattr(hit, 'blip_logit', ''),
+                             fused_score=getattr(hit, 'fused_score', '')))
     return buffer.getvalue().encode('utf-8')
 
 
@@ -114,7 +116,7 @@ def show_results(response: dict, rows: list[dict]) -> None:
             st.download_button('Export results', export_results(response, rows),
                                file_name='visiosearch_results.csv', mime='text/csv')
         with note:
-            st.markdown('<p class="score-note">Similarity scores describe the match to your words; they are not probabilities.</p>',
+            st.markdown('<p class="score-note">Match scores describe relevance to your words; they are not probabilities.</p>',
                         unsafe_allow_html=True)
 
 
@@ -129,7 +131,14 @@ def main() -> None:
     st.markdown(f'<style>{styles}</style>', unsafe_allow_html=True)
     try:
         rows = metadata_rows(str(INDEX_DIR))
-        embedding_matrix(str(INDEX_DIR), DEFAULT_MODEL, len(rows))
+        prepare_search_index(str(INDEX_DIR), len(rows))
+    except ArtifactError as exc:
+        LOGGER.exception('Two-stage artifacts failed validation')
+        photo_ui.header(len(rows))
+        photo_ui.hero()
+        st.error(str(exc))
+        st.code('python scripts/prepare_two_stage.py --download-models', language='bash')
+        return
     except (OSError, ValueError, KeyError):
         LOGGER.exception('Photo library is unavailable')
         photo_ui.header(None)
@@ -142,12 +151,19 @@ def main() -> None:
 
     photo_ui.header(len(rows))
     photo_ui.hero()
+    if active_pipeline() == 'pretrained_siglip':
+        st.warning('The original pretrained SigLIP fallback is active. Two-stage retrieval is explicitly disabled.')
     if len(rows) != 8000:
         st.warning(f'This library contains {len(rows):,} of 8,000 images. Restore the full index to search the complete collection.')
     query, top_k, submitted = search_controls()
     if submitted:
         run_search(query, top_k, len(rows))
     response = st.session_state.get('search_response')
+    expected_pipeline = DEFAULT_MODEL if active_pipeline() == 'two_stage' else 'Pretrained SigLIP (explicit fallback)'
+    if response and response.get('pipeline') != expected_pipeline:
+        # Invalidate responses from an older app version instead of relabeling their scores.
+        del st.session_state['search_response']
+        response = None
     if response:
         show_results(response, rows)
     else:
