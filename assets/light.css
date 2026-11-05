@@ -1,0 +1,26 @@
+/* Override the shared palette; layout and interactions use the same rules. */
+:root {
+  color-scheme: light;
+  --page:#f5f8f7;
+  --panel:#ffffff;
+  --line:#d6e2dc;
+  --muted:#5c7066;
+  --accent:#12735a;
+  --foreground:#172e25;
+  --text:#354d43;
+  --secondary:#536b5f;
+  --subtle:#5c7066;
+  --hero-glow:#c7f1e550;
+  --input:#ffffff;
+  --input-line:#b4cec1;
+  --placeholder:#62766b;
+  --accent-hover:#0c5e48;
+  --on-accent:#ffffff;
+  --accent-soft:#12735a12;
+  --hover-soft:#12735a0c;
+  --card-hover:#5d9b80;
+  --shadow:#163d2415;
+  --empty-from:#e8f5ed;
+  --empty-to:#ffffff;
+  --hairline:#dce7e1;
+}
